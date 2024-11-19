@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/csv"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -12,9 +11,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jessevdk/go-flags"
 	"gonum.org/v1/gonum/stat"
 	"gonum.org/v1/gonum/stat/distuv"
 )
+
+type Options struct {
+	Baseline   string  `short:"b" long:"baseline" description:"Label for baseline series"`
+	Experiment string  `short:"e" long:"experiment" description:"Label for experiment series"`
+	Confidence float64 `long:"confidence" default:"0.95" description:"Confidence level for statistical tests"`
+	Args       struct {
+		InputFile string `positional-arg-name:"FILE" description:"Input CSV file"`
+	} `positional-args:"yes"`
+}
 
 type Measurement struct {
 	Date  time.Time
@@ -75,38 +84,103 @@ func welchTTest(x, y []float64) (t, p float64) {
 }
 
 func main() {
-	// Parse command line flags
-	inputFile := flag.String("input", "", "Input CSV file path")
-	benchmarkLabel := flag.String("benchmark", "", "Label for benchmark series")
-	experimentLabel := flag.String("experiment", "", "Label for experiment series")
-	confidenceLevel := flag.Float64("confidence", 0.95, "Confidence level for statistical tests")
-	flag.Parse()
+	var opts Options
+	parser := flags.NewParser(&opts, flags.Default)
+	parser.Usage = "[OPTIONS] FILE"
 
-	if *inputFile == "" || *benchmarkLabel == "" || *experimentLabel == "" {
-		flag.Usage()
+	_, err := parser.Parse()
+	if err != nil {
+		os.Exit(1)
+	}
+
+	if opts.Args.InputFile == "" {
+		parser.WriteHelp(os.Stderr)
 		os.Exit(1)
 	}
 
 	// Read and parse data
-	data, err := readCSV(*inputFile)
+	data, err := readCSV(opts.Args.InputFile)
 	if err != nil {
 		log.Fatalf("Error reading CSV: %v", err)
 	}
 
-	// Split data into benchmark and experiment series
-	benchmark := filterByLabel(data, *benchmarkLabel)
-	experiment := filterByLabel(data, *experimentLabel)
+	// Get unique labels from data
+	labels := getUniqueLabels(data)
+	if len(labels) != 2 && (opts.Baseline == "" || opts.Experiment == "") {
+		log.Fatalf("Found %d labels in data. When more than 2 labels exist, --baseline and --experiment must be specified.\nAvailable labels: %v",
+			len(labels), strings.Join(labels, ", "))
+	}
+
+	// Auto-select labels if not specified
+	if opts.Baseline == "" && opts.Experiment == "" {
+		opts.Baseline = labels[0]
+		opts.Experiment = labels[1]
+		fmt.Printf("Auto-selected baseline: %s, experiment: %s\n", opts.Baseline, opts.Experiment)
+	} else if opts.Baseline == "" {
+		// If only experiment is specified, use the other label as baseline
+		for _, label := range labels {
+			if label != opts.Experiment {
+				opts.Baseline = label
+				fmt.Printf("Auto-selected baseline: %s\n", opts.Baseline)
+				break
+			}
+		}
+	} else if opts.Experiment == "" {
+		// If only baseline is specified, use the other label as experiment
+		for _, label := range labels {
+			if label != opts.Baseline {
+				opts.Experiment = label
+				fmt.Printf("Auto-selected experiment: %s\n", opts.Experiment)
+				break
+			}
+		}
+	}
+
+	// Validate that selected labels exist in data
+	if !containsLabel(labels, opts.Baseline) || !containsLabel(labels, opts.Experiment) {
+		log.Fatalf("Specified labels not found in data. Available labels: %v", strings.Join(labels, ", "))
+	}
+
+	// Split data into baseline and experiment series
+	baseline := filterByLabel(data, opts.Baseline)
+	experiment := filterByLabel(data, opts.Experiment)
+
+	if len(baseline.Measurements) == 0 || len(experiment.Measurements) == 0 {
+		log.Fatalf("No data found for one or both labels")
+	}
 
 	// Perform analysis
-	analysis := analyzeTimeSeries(benchmark, experiment, *confidenceLevel)
+	analysis := analyzeTimeSeries(baseline, experiment, opts.Confidence)
 
 	// Determine time ranges and what breakdowns to show
-	timeRange := benchmark.MaxDate.Sub(benchmark.MinDate)
+	timeRange := baseline.MaxDate.Sub(baseline.MinDate)
 	showHourly := timeRange >= 24*time.Hour
 	showDaily := timeRange >= 7*24*time.Hour
 
 	// Print results
 	printResults(analysis, showHourly, showDaily)
+}
+
+func getUniqueLabels(data []Measurement) []string {
+	labelMap := make(map[string]struct{})
+	for _, m := range data {
+		labelMap[m.Label] = struct{}{}
+	}
+
+	labels := make([]string, 0, len(labelMap))
+	for label := range labelMap {
+		labels = append(labels, label)
+	}
+	return labels
+}
+
+func containsLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
 }
 
 func readCSV(filename string) ([]Measurement, error) {
