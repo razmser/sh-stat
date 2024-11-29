@@ -11,16 +11,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/jessevdk/go-flags"
 	"gonum.org/v1/gonum/stat"
 	"gonum.org/v1/gonum/stat/distuv"
 )
 
 type Options struct {
-	Baseline   string  `short:"b" long:"baseline" description:"Label for baseline series"`
-	Experiment string  `short:"e" long:"experiment" description:"Label for experiment series"`
-	Confidence float64 `long:"confidence" default:"0.95" description:"Confidence level for statistical tests"`
-	Args       struct {
+	Baseline    string  `short:"b" long:"baseline" description:"Label for baseline series"`
+	Experiment  string  `short:"e" long:"experiment" description:"Label for experiment series"`
+	Confidence  float64 `long:"confidence" default:"0.95" description:"Confidence level for statistical tests"`
+	Threshold   float64 `long:"threshold" default:"3.0" description:"Threshold for coloring difference values (percentage)"`
+	NoColor     bool    `long:"no-color" description:"Disable colored output"`
+	Args        struct {
 		InputFile string `positional-arg-name:"FILE" description:"Input CSV file"`
 	} `positional-args:"yes"`
 }
@@ -53,7 +56,6 @@ type TimeSegmentAnalysis struct {
 	Significant bool
 }
 
-// welchTTest implements Welch's t-test for two samples
 func welchTTest(x, y []float64) (t, p float64) {
 	nx := float64(len(x))
 	ny := float64(len(y))
@@ -67,98 +69,15 @@ func welchTTest(x, y []float64) (t, p float64) {
 	varX := stat.Variance(x, nil)
 	varY := stat.Variance(y, nil)
 
-	// Calculate t-statistic
 	t = (meanX - meanY) / math.Sqrt(varX/nx+varY/ny)
 
-	// Calculate degrees of freedom using Welch–Satterthwaite equation
 	df := math.Pow(varX/nx+varY/ny, 2) /
 		(math.Pow(varX/nx, 2)/(nx-1) + math.Pow(varY/ny, 2)/(ny-1))
 
-	// Create a Student's t-distribution with calculated degrees of freedom
 	dist := distuv.StudentsT{Nu: df}
-
-	// Calculate two-tailed p-value
 	p = 2 * dist.Survival(math.Abs(t))
 
 	return t, p
-}
-
-func main() {
-	var opts Options
-	parser := flags.NewParser(&opts, flags.Default)
-	parser.Usage = "[OPTIONS] FILE"
-
-	_, err := parser.Parse()
-	if err != nil {
-		os.Exit(1)
-	}
-
-	if opts.Args.InputFile == "" {
-		parser.WriteHelp(os.Stderr)
-		os.Exit(1)
-	}
-
-	// Read and parse data
-	data, err := readCSV(opts.Args.InputFile)
-	if err != nil {
-		log.Fatalf("Error reading CSV: %v", err)
-	}
-
-	// Get unique labels from data
-	labels := getUniqueLabels(data)
-	if len(labels) != 2 && (opts.Baseline == "" || opts.Experiment == "") {
-		log.Fatalf("Found %d labels in data. When more than 2 labels exist, --baseline and --experiment must be specified.\nAvailable labels: %v",
-			len(labels), strings.Join(labels, ", "))
-	}
-
-	// Auto-select labels if not specified
-	if opts.Baseline == "" && opts.Experiment == "" {
-		opts.Baseline = labels[0]
-		opts.Experiment = labels[1]
-		fmt.Printf("Auto-selected baseline: %s, experiment: %s\n", opts.Baseline, opts.Experiment)
-	} else if opts.Baseline == "" {
-		// If only experiment is specified, use the other label as baseline
-		for _, label := range labels {
-			if label != opts.Experiment {
-				opts.Baseline = label
-				fmt.Printf("Auto-selected baseline: %s\n", opts.Baseline)
-				break
-			}
-		}
-	} else if opts.Experiment == "" {
-		// If only baseline is specified, use the other label as experiment
-		for _, label := range labels {
-			if label != opts.Baseline {
-				opts.Experiment = label
-				fmt.Printf("Auto-selected experiment: %s\n", opts.Experiment)
-				break
-			}
-		}
-	}
-
-	// Validate that selected labels exist in data
-	if !containsLabel(labels, opts.Baseline) || !containsLabel(labels, opts.Experiment) {
-		log.Fatalf("Specified labels not found in data. Available labels: %v", strings.Join(labels, ", "))
-	}
-
-	// Split data into baseline and experiment series
-	baseline := filterByLabel(data, opts.Baseline)
-	experiment := filterByLabel(data, opts.Experiment)
-
-	if len(baseline.Measurements) == 0 || len(experiment.Measurements) == 0 {
-		log.Fatalf("No data found for one or both labels")
-	}
-
-	// Perform analysis
-	analysis := analyzeTimeSeries(baseline, experiment, opts.Confidence)
-
-	// Determine time ranges and what breakdowns to show
-	timeRange := baseline.MaxDate.Sub(baseline.MinDate)
-	showHourly := timeRange >= 24*time.Hour
-	showDaily := timeRange >= 7*24*time.Hour
-
-	// Print results
-	printResults(analysis, showHourly, showDaily)
 }
 
 func getUniqueLabels(data []Measurement) []string {
@@ -191,7 +110,7 @@ func readCSV(filename string) ([]Measurement, error) {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	reader.Comma = ';' // Set delimiter to semicolon
+	reader.Comma = ';'
 
 	// Skip header
 	_, err = reader.Read()
@@ -297,10 +216,8 @@ func analyzeSegment(benchmark, experiment []Measurement, confidenceLevel float64
 	benchStdDev := stat.StdDev(benchValues, nil)
 	expStdDev := stat.StdDev(expValues, nil)
 
-	// Calculate t-statistic and p-value using Welch's t-test
 	_, pValue := welchTTest(benchValues, expValues)
 
-	// Calculate confidence intervals
 	benchCI := confidenceInterval(benchValues, confidenceLevel)
 	expCI := confidenceInterval(expValues, confidenceLevel)
 
@@ -353,7 +270,6 @@ func confidenceInterval(values []float64, confidenceLevel float64) [2]float64 {
 	mean := stat.Mean(values, nil)
 	stdErr := stat.StdDev(values, nil) / math.Sqrt(float64(len(values)))
 
-	// Get t-value for given confidence level and degrees of freedom
 	dist := distuv.StudentsT{Nu: float64(len(values) - 1)}
 	tValue := dist.Quantile((1 + confidenceLevel) / 2)
 
@@ -361,38 +277,44 @@ func confidenceInterval(values []float64, confidenceLevel float64) [2]float64 {
 	return [2]float64{mean - margin, mean + margin}
 }
 
-func printResults(results map[string]TimeSegmentAnalysis, showHourly, showDaily bool) {
-	// Print overall results
+func printResults(results map[string]TimeSegmentAnalysis, showHourly, showDaily bool, threshold float64, useColor bool) {
+	green := color.New(color.FgGreen)
+	red := color.New(color.FgRed)
+
+	formatDifference := func(diff float64) string {
+		if !useColor {
+			return fmt.Sprintf("%.2f%%", diff)
+		}
+
+		if math.Abs(diff) <= threshold {
+			return fmt.Sprintf("%.2f%%", diff)
+		}
+
+		if diff < 0 {
+			return green.Sprintf("%.2f%%", diff)
+		}
+		return red.Sprintf("%.2f%%", diff)
+	}
+
 	overall := results["overall"]
 	fmt.Println("\nOverall Analysis Results:")
 	fmt.Println(strings.Repeat("-", 50))
 	fmt.Printf("Benchmark mean: %.4f (n=%d)\n", overall.Benchmark.Mean, overall.Benchmark.Count)
 	fmt.Printf("Experiment mean: %.4f (n=%d)\n", overall.Experiment.Mean, overall.Experiment.Count)
-	fmt.Printf("Difference: %.2f%%\n", overall.Difference)
+	fmt.Printf("Difference: %s\n", formatDifference(overall.Difference))
 	fmt.Printf("P-value: %.4f\n", overall.PValue)
-	if overall.Significant {
-		fmt.Println("Result is STATISTICALLY SIGNIFICANT")
-	} else {
-		fmt.Println("Result is NOT statistically significant")
-	}
 
-	// Print hourly breakdown if applicable
 	if showHourly {
 		fmt.Println("\nHourly Breakdown:")
 		fmt.Println(strings.Repeat("-", 50))
 		for hour := 0; hour < 24; hour++ {
 			key := fmt.Sprintf("hour_%02d", hour)
 			if analysis, ok := results[key]; ok {
-				significance := ""
-				if analysis.Significant {
-					significance = " (SIGNIFICANT)"
-				}
-				fmt.Printf("Hour %02d: %.2f%%%s\n", hour, analysis.Difference, significance)
+				fmt.Printf("Hour %02d: %s\n", hour, formatDifference(analysis.Difference))
 			}
 		}
 	}
 
-	// Print daily breakdown if applicable
 	if showDaily {
 		fmt.Println("\nDay of Week Breakdown:")
 		fmt.Println(strings.Repeat("-", 50))
@@ -400,12 +322,86 @@ func printResults(results map[string]TimeSegmentAnalysis, showHourly, showDaily 
 		for day := 0; day < 7; day++ {
 			key := fmt.Sprintf("day_%d", day)
 			if analysis, ok := results[key]; ok {
-				significance := ""
-				if analysis.Significant {
-					significance = " (SIGNIFICANT)"
-				}
-				fmt.Printf("%s: %.2f%%%s\n", days[day], analysis.Difference, significance)
+				fmt.Printf("%s: %s\n", days[day], formatDifference(analysis.Difference))
 			}
 		}
 	}
+}
+
+func isTerminal() bool {
+	fileInfo, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fileInfo.Mode() & os.ModeCharDevice) != 0
+}
+
+func main() {
+	var opts Options
+	parser := flags.NewParser(&opts, flags.Default)
+	parser.Usage = "[OPTIONS] FILE"
+
+	_, err := parser.Parse()
+	if err != nil {
+		os.Exit(1)
+	}
+
+	if opts.Args.InputFile == "" {
+		parser.WriteHelp(os.Stderr)
+		os.Exit(1)
+	}
+
+	data, err := readCSV(opts.Args.InputFile)
+	if err != nil {
+		log.Fatalf("Error reading CSV: %v", err)
+	}
+
+	labels := getUniqueLabels(data)
+	if len(labels) != 2 && (opts.Baseline == "" || opts.Experiment == "") {
+		log.Fatalf("Found %d labels in data. When more than 2 labels exist, --baseline and --experiment must be specified.\nAvailable labels: %v",
+			len(labels), strings.Join(labels, ", "))
+	}
+
+	if opts.Baseline == "" && opts.Experiment == "" {
+		opts.Baseline = labels[0]
+		opts.Experiment = labels[1]
+		fmt.Printf("Auto-selected baseline: %s, experiment: %s\n", opts.Baseline, opts.Experiment)
+	} else if opts.Baseline == "" {
+		for _, label := range labels {
+			if label != opts.Experiment {
+				opts.Baseline = label
+				fmt.Printf("Auto-selected baseline: %s\n", opts.Baseline)
+				break
+			}
+		}
+	} else if opts.Experiment == "" {
+		for _, label := range labels {
+			if label != opts.Baseline {
+				opts.Experiment = label
+				fmt.Printf("Auto-selected experiment: %s\n", opts.Experiment)
+				break
+			}
+		}
+	}
+
+	if !containsLabel(labels, opts.Baseline) || !containsLabel(labels, opts.Experiment) {
+		log.Fatalf("Specified labels not found in data. Available labels: %v", strings.Join(labels, ", "))
+	}
+
+	baseline := filterByLabel(data, opts.Baseline)
+	experiment := filterByLabel(data, opts.Experiment)
+
+	if len(baseline.Measurements) == 0 || len(experiment.Measurements) == 0 {
+		log.Fatalf("No data found for one or both labels")
+	}
+
+	analysis := analyzeTimeSeries(baseline, experiment, opts.Confidence)
+
+	timeRange := baseline.MaxDate.Sub(baseline.MinDate)
+	showHourly := timeRange >= 24*time.Hour
+	showDaily := timeRange >= 7*24*time.Hour
+
+	useColor := !opts.NoColor && isTerminal()
+
+	printResults(analysis, showHourly, showDaily, opts.Threshold, useColor)
 }
